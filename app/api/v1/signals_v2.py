@@ -14,6 +14,7 @@ Returns the full expanded asset universe with:
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -112,74 +113,427 @@ _EVENT_ASSET_RULES: dict[str, dict[str, tuple[str, float]]] = {
 }
 
 # ── Explainable analysis helpers ──────────────────────────────────────────────
+# Every number surfaced to the UI is produced here, once, and reused by the
+# action, the reasoning chain, the summary and the explainability payload so the
+# narrative can never drift from the decision it describes.
+_ACTION_CUTOFF = 0.35
+_MOVEMENT_WEIGHT = 0.70
+_EVENT_WEIGHT = 0.30
+_CONFIDENCE_BASE = 0.45
+_CONFIDENCE_SLOPE = 0.45
+_CONFIDENCE_CAP = 0.95
+_HOLD_CONFIDENCE_CAP = 0.55
+
+_MOVEMENT_THRESHOLD_PCT: dict[str, float] = {
+    "stock": 0.50, "crypto": 1.00, "forex": 0.15, "commodity": 0.60,
+    "bond": 0.35, "etf": 0.45, "equity_index": 0.40,
+}
+_FRESHNESS: dict[str, float] = {
+    "live": 1.0, "delayed": 0.85, "stale": 0.55, "unavailable": 0.0,
+}
+# Feeds that publish a daily level with no previous close. Their change is
+# reported as 0.0, which means "not measured" rather than "flat".
+_REFERENCE_ONLY_SOURCES = frozenset({"exchangerate-api"})
+
+
+@dataclass(frozen=True)
+class ActionBreakdown:
+    """The exact inputs, terms and thresholds behind one signal decision."""
+
+    priced: bool
+    price: float
+    change_pct: float
+    movement_available: bool
+    data_source: str
+    threshold_pct: float
+    movement_score: float
+    movement_clamped: bool
+    movement_weight: float
+    movement_term: float
+    event_matched: bool
+    event_applied: bool
+    event_title: str | None
+    event_category: str | None
+    event_severity: float
+    event_rule_action: str | None
+    event_rule_confidence: float
+    event_score: float
+    event_weight: float
+    event_term: float
+    raw_score: float
+    action: str
+    confidence_base: float
+    freshness: float
+    confidence: float
+    buy_trigger_pct: float | None
+    sell_trigger_pct: float | None
+    quote_timestamp: str
+
+
+def _build_action_breakdown(
+    asset: AssetDefinition,
+    market: dict,
+    event: dict | None,
+) -> ActionBreakdown:
+    price = float(market.get("price") or 0.0)
+    threshold_pct = _MOVEMENT_THRESHOLD_PCT.get(asset.category, 0.50)
+    status = str(market.get("data_status") or "unavailable")
+    source = str(market.get("source") or "unknown")
+    freshness = _FRESHNESS.get(status, 0.7)
+    event_matched = event is not None
+    event_title = str(event["title"]) if event else None
+    event_category = str(event["category"]) if event else None
+    event_severity = float(event["severity"]) if event else 0.0
+    quote_timestamp = _iso_timestamp(market.get("timestamp"))
+
+    if price <= 0 or market.get("status") == "unavailable":
+        return ActionBreakdown(
+            priced=False, price=price, change_pct=0.0, movement_available=False,
+            data_source=source, threshold_pct=threshold_pct,
+            movement_score=0.0, movement_clamped=False, movement_weight=1.0, movement_term=0.0,
+            event_matched=event_matched, event_applied=False, event_title=event_title,
+            event_category=event_category, event_severity=event_severity,
+            event_rule_action=None, event_rule_confidence=0.0, event_score=0.0,
+            event_weight=0.0, event_term=0.0, raw_score=0.0, action="HOLD",
+            confidence_base=_CONFIDENCE_BASE, freshness=freshness, confidence=0.0,
+            buy_trigger_pct=None, sell_trigger_pct=None, quote_timestamp=quote_timestamp,
+        )
+
+    # A reference-rate feed publishes a daily level without a previous close, so
+    # its "0% change" means "not measured", not "flat". Scoring it against a
+    # hardcoded base price would turn an 18-month-old constant into a session
+    # move and hand every pair a maxed-out directional call.
+    change_value = market.get("change")
+    movement_available = (
+        change_value is not None and source not in _REFERENCE_ONLY_SOURCES
+    )
+    change_pct = float(change_value or 0.0) if movement_available else 0.0
+    raw_movement = change_pct / threshold_pct if threshold_pct else 0.0
+    movement_score = max(-1.0, min(1.0, raw_movement))
+    movement_clamped = abs(raw_movement) > 1.0
+
+    rule: tuple[str, float] | None = None
+    if event:
+        rule = _EVENT_ASSET_RULES.get(event["category"], {}).get(asset.symbol)
+
+    if rule:
+        rule_action, rule_confidence = rule
+        direction = 1.0 if rule_action == "BUY" else -1.0 if rule_action == "SELL" else 0.0
+        event_score = direction * rule_confidence * event_severity
+        movement_weight, event_weight = _MOVEMENT_WEIGHT, _EVENT_WEIGHT
+        event_applied = True
+    else:
+        rule_action, rule_confidence = None, 0.0
+        event_score = 0.0
+        movement_weight, event_weight = 1.0, 0.0
+        event_applied = False
+
+    movement_term = movement_score * movement_weight
+    event_term = event_score * event_weight
+    raw_score = movement_term + event_term
+    action = (
+        "BUY" if raw_score >= _ACTION_CUTOFF
+        else "SELL" if raw_score <= -_ACTION_CUTOFF
+        else "HOLD"
+    )
+    confidence_base = _CONFIDENCE_BASE + abs(raw_score) * _CONFIDENCE_SLOPE
+    confidence = min(_CONFIDENCE_CAP, confidence_base * freshness)
+    if action == "HOLD":
+        confidence = min(confidence, _HOLD_CONFIDENCE_CAP * freshness)
+
+    return ActionBreakdown(
+        priced=True, price=price, change_pct=change_pct,
+        movement_available=movement_available, data_source=source,
+        threshold_pct=threshold_pct,
+        movement_score=movement_score, movement_clamped=movement_clamped,
+        movement_weight=movement_weight, movement_term=movement_term,
+        event_matched=event_matched, event_applied=event_applied, event_title=event_title,
+        event_category=event_category, event_severity=event_severity,
+        event_rule_action=rule_action, event_rule_confidence=rule_confidence,
+        event_score=event_score, event_weight=event_weight, event_term=event_term,
+        raw_score=raw_score, action=action, confidence_base=confidence_base,
+        freshness=freshness, confidence=confidence,
+        buy_trigger_pct=_trigger_change_pct(
+            _ACTION_CUTOFF, event_term, movement_weight, threshold_pct,
+        ) if movement_available else None,
+        sell_trigger_pct=_trigger_change_pct(
+            -_ACTION_CUTOFF, event_term, movement_weight, threshold_pct,
+        ) if movement_available else None,
+        quote_timestamp=quote_timestamp,
+    )
+
+
+def _trigger_change_pct(
+    target_score: float,
+    event_term: float,
+    movement_weight: float,
+    threshold_pct: float,
+) -> float | None:
+    """Session change that hits a score cutoff with the event overlay held fixed."""
+    if movement_weight <= 0:
+        return None
+    required = (target_score - event_term) / movement_weight
+    if abs(required) > 1.0:
+        return None
+    return round(required * threshold_pct, 4)
+
+
+def _direction_word(score: float) -> str:
+    if score > 0.05:
+        return "bullish"
+    if score < -0.05:
+        return "bearish"
+    return "flat"
+
+
+def _fmt_price(value: float) -> str:
+    if value >= 10000:
+        return f"{value:,.0f}"
+    if value >= 100:
+        return f"{value:,.2f}"
+    if value >= 1:
+        return f"{value:,.4f}"
+    return f"{value:.6f}"
+
+
+def _pct(value: float) -> str:
+    """Half-up percent, matching the rounding the UI applies to the same number."""
+    return f"{int(value * 100 + 0.5)}%"
+
+
 def _build_reasoning_chain(
     asset: AssetDefinition,
-    action: str,
-    event: dict | None,
-    confidence: float,
-    market: dict,
+    b: ActionBreakdown,
 ) -> list[dict]:
-    quote_ts = _iso_timestamp(market.get("timestamp"))
-    change = float(market.get("change") or 0.0)
-    source = str(market.get("source") or "unknown")
-    status = str(market.get("data_status") or "unavailable")
-    event_evidence = (
-        f"{event['title']} · severity {float(event['severity']):.0%}"
-        if event else "No qualifying real event was found in the last 48 hours"
-    )
-    return [
+    status = "unpriced" if not b.priced else f"freshness ×{b.freshness:.2f}"
+
+    if not b.priced:
+        return [
+            {
+                "step": 1, "label": "Market Inputs", "phase": "market_data",
+                "description": f"No usable quote for {asset.label}; the signal cannot be priced.",
+                "evidence": f"Last known quote {b.quote_timestamp}",
+                "metric": "no quote",
+            },
+            {
+                "step": 2, "label": "Decision", "phase": "signal",
+                "description": "HOLD with zero confidence until a price is available.",
+                "evidence": "Directional calls require a priced quote",
+                "metric": "HOLD · 0%",
+            },
+        ]
+
+    if b.movement_available:
+        market_description = (
+            f"{asset.label} last printed {_fmt_price(b.price)} "
+            f"({b.change_pct:+.2f}% this session) from the {b.data_source} feed."
+        )
+        movement_description = (
+            f"{b.change_pct:+.2f}% divided by the {b.threshold_pct:.2f}% "
+            f"{asset.category} threshold gives a {_direction_word(b.movement_score)} "
+            f"movement score of {b.movement_score:+.2f}"
+            f"{' (clamped at the ±1.00 cap)' if b.movement_clamped else ''}."
+        )
+        basis = "provider change"
+    else:
+        market_description = (
+            f"{asset.label} last printed {_fmt_price(b.price)}. The {b.data_source} feed "
+            f"publishes a reference rate without a previous close, so no session move can "
+            f"be measured."
+        )
+        movement_description = (
+            "With no previous close there is no measurable change, so the movement score "
+            "stays at 0.00 instead of being inferred from a stale reference price."
+        )
+        basis = "movement not published"
+
+    steps: list[dict] = [
         {
-            "step": 1, "label": "Market Quote",
-            "description": f"{asset.label} quote received from {source}",
-            "evidence": f"As of {quote_ts} · status {status}",
-            "phase": "market_data", "confidence_contribution": 0.40,
+            "step": 1, "label": "Market Inputs", "phase": "market_data",
+            "description": market_description,
+            "evidence": (
+                f"Quote {b.quote_timestamp} · {status} · basis {basis} · "
+                f"threshold {b.threshold_pct:.2f}% for {asset.category}"
+            ),
+            "metric": f"{b.change_pct:+.2f}%",
         },
         {
-            "step": 2, "label": "Movement Analysis",
-            "description": f"Observed session movement is {change:+.2f}%",
-            "evidence": "Direction is calculated from the provider's current and previous-session values",
-            "phase": "movement", "confidence_contribution": 0.35,
-        },
-        {
-            "step": 3, "label": "Event Context",
-            "description": event["category"].replace("_", " ") if event else "No event overlay applied",
-            "evidence": event_evidence,
-            "phase": "event", "confidence_contribution": 0.15 if event else 0.0,
-        },
-        {
-            "step": 4, "label": "Decision",
-            "description": f"{action} with {confidence:.0%} confidence",
-            "evidence": "Signal requires a priced quote and combines observed movement with any verified event sensitivity",
-            "phase": "signal", "confidence_contribution": 0.10,
+            "step": 2, "label": "Movement vs Threshold", "phase": "movement",
+            "description": movement_description,
+            "evidence": (
+                f"Movement term = {b.movement_score:+.2f} × {_pct(b.movement_weight)} "
+                f"= {b.movement_term:+.3f}"
+            ),
+            "metric": f"{b.movement_term:+.3f}",
         },
     ]
+
+    if b.event_applied:
+        if b.event_rule_action and b.event_rule_action != "HOLD":
+            description = (
+                f"{b.event_category.replace('_', ' ')} rule reads {b.event_rule_action} at "
+                f"{_pct(b.event_rule_confidence)} conviction with {_pct(b.event_severity)} severity."
+            )
+        else:
+            description = (
+                f"{b.event_category.replace('_', ' ')} rule reads HOLD at "
+                f"{_pct(b.event_rule_confidence)} conviction — no directional push."
+            )
+        evidence = (
+            f"Event term = {b.event_score:+.3f} × {_pct(b.event_weight)} "
+            f"= {b.event_term:+.3f} · {b.event_title}"
+        )
+        metric = f"{b.event_term:+.3f}"
+    elif b.event_matched:
+        description = (
+            "A verified event matched this asset's sensitivity list, but no directional "
+            "rule exists for the pair, so the overlay carries zero weight."
+        )
+        evidence = f"{b.event_title} · severity {_pct(b.event_severity)} · weight 0%"
+        metric = "0.000"
+    else:
+        description = (
+            "No verified event matched this asset in the last 48 hours; the score rests "
+            + (
+                "on observed market movement alone."
+                if b.movement_available
+                else "on nothing measurable, so it stays at zero."
+            )
+        )
+        evidence = "Event weight 0% · movement weight 100%"
+        metric = "0.000"
+
+    steps.append({
+        "step": 3, "label": "Event Overlay", "phase": "event",
+        "description": description, "evidence": evidence, "metric": metric,
+    })
+
+    hold_note = " · HOLD confidence capped at 55% of freshness" if b.action == "HOLD" else ""
+    steps.append({
+        "step": 4, "label": "Decision", "phase": "signal",
+        "description": (
+            f"Movement {b.movement_term:+.3f} plus event {b.event_term:+.3f} gives "
+            f"{b.raw_score:+.3f}, which lands {b.action} against the ±{_ACTION_CUTOFF:.2f} cutoff."
+        ),
+        "evidence": (
+            f"Confidence = ({_CONFIDENCE_BASE:.2f} + {_CONFIDENCE_SLOPE:.2f} × "
+            f"{abs(b.raw_score):.2f}) × {b.freshness:.2f} = {_pct(b.confidence)}{hold_note}"
+        ),
+        "metric": f"{b.action} · {_pct(b.confidence)}",
+    })
+    return steps
+
+
+def _summarize_reasoning(asset: AssetDefinition, b: ActionBreakdown) -> str:
+    if not b.priced:
+        return f"No live quote for {asset.label}; HOLD at zero confidence until a price is available."
+    if not b.movement_available:
+        return (
+            f"HOLD {asset.label}: the {b.data_source} feed publishes no previous close, so "
+            f"there is no measurable session move; the score stays at {b.raw_score:+.2f} and "
+            f"the model holds at {_pct(b.confidence)} confidence."
+        )
+    overlay = (
+        f" The {b.event_category.replace('_', ' ')} overlay {b.event_rule_action} at "
+        f"{_pct(b.event_rule_confidence)} adds {b.event_term:+.2f}."
+        if b.event_applied and b.event_term
+        else ""
+    )
+    if b.action == "HOLD":
+        return (
+            f"HOLD {asset.label}: the {b.change_pct:+.2f}% session move scores "
+            f"{b.raw_score:+.2f}, inside the ±{_ACTION_CUTOFF:.2f} dead zone, at "
+            f"{_pct(b.confidence)} confidence.{overlay}"
+        )
+    return (
+        f"{b.action} {asset.label}: the {b.change_pct:+.2f}% session move against the "
+        f"{b.threshold_pct:.2f}% {asset.category} threshold scores {b.movement_term:+.2f}.{overlay} "
+        f"Blended score {b.raw_score:+.2f} triggers {b.action} at {_pct(b.confidence)} confidence."
+    )
+
+
+def _build_explainability(
+    b: ActionBreakdown,
+    market: dict,
+    volatility_label: str,
+    atr_pct: float,
+) -> dict:
+    return {
+        "priced": b.priced,
+        "price": round(b.price, 6),
+        "change_pct": round(b.change_pct, 4),
+        "movement_available": b.movement_available,
+        "change_source": "provider" if b.movement_available else "unavailable",
+        "threshold_pct": b.threshold_pct,
+        "movement_score": round(b.movement_score, 4),
+        "movement_clamped": b.movement_clamped,
+        "movement_weight": b.movement_weight,
+        "movement_term": round(b.movement_term, 4),
+        "event": {
+            "matched": b.event_matched,
+            "applied": b.event_applied,
+            "title": b.event_title,
+            "category": b.event_category,
+            "severity": round(b.event_severity, 4),
+            "rule_action": b.event_rule_action,
+            "rule_confidence": b.event_rule_confidence,
+            "event_score": round(b.event_score, 4),
+            "weight": b.event_weight,
+            "term": round(b.event_term, 4),
+        },
+        "raw_score": round(b.raw_score, 4),
+        "action_cutoff": _ACTION_CUTOFF,
+        "confidence_base": round(b.confidence_base, 4),
+        "confidence_cap": _CONFIDENCE_CAP,
+        "hold_cap": _HOLD_CONFIDENCE_CAP,
+        "freshness": b.freshness,
+        "confidence": round(b.confidence, 4),
+        "buy_trigger_pct": b.buy_trigger_pct,
+        "sell_trigger_pct": b.sell_trigger_pct,
+        "volatility_label": volatility_label,
+        "atr_pct": round(atr_pct, 6),
+        "data_status": market.get("data_status", "unavailable"),
+        "data_source": market.get("source", "unknown"),
+        "quote_timestamp": _iso_timestamp(market.get("timestamp")),
+        "basis": "observed_market_movement_and_verified_events",
+    }
+
 
 # ── Event → market reaction timeline ─────────────────────────────────────────
 def _build_event_timeline(
     event: dict | None,
     asset: AssetDefinition,
-    action: str,
-    market: dict,
-    confidence: float,
+    b: ActionBreakdown,
 ) -> list[dict]:
     timeline = [
         {
-            "ts": _iso_timestamp(market.get("timestamp")),
+            "ts": b.quote_timestamp,
             "label": "Market Quote Updated",
-            "detail": f"{asset.label} {float(market.get('change') or 0.0):+.2f}% · {market.get('source', 'unknown')}",
+            "detail": (
+                f"{asset.label} {b.change_pct:+.2f}% · "
+                f"movement term {b.movement_term:+.3f}"
+                if b.movement_available
+                else f"{asset.label} reference rate · no previous close published"
+            ),
             "phase": "market_data",
         },
     ]
     if event:
         timeline.append({
             "ts": event["ts"], "label": "Event Classified",
-            "detail": f"{event['title']} · severity {float(event['severity']):.0%}",
+            "detail": (
+                f"{event['title']} · severity {_pct(float(event['severity']))}"
+                + (f" · event term {b.event_term:+.3f}" if b.event_applied else " · no rule")
+            ),
             "phase": "event",
         })
     timeline.append({
         "ts": datetime.now(UTC).isoformat(),
-        "label": f"{action} Analysis Generated",
-        "detail": f"{asset.label} · confidence {confidence:.0%}",
+        "label": f"{b.action} Analysis Generated",
+        "detail": (
+            f"{asset.label} · score {b.raw_score:+.3f} · "
+            f"confidence {_pct(b.confidence)}"
+        ),
         "phase": "signal",
     })
     return sorted(timeline, key=lambda row: row["ts"])
@@ -202,7 +556,7 @@ async def get_all_signals(
     - Event → market reaction timeline
     - 4-step causal reasoning chain
     """
-    cache_key = _make_cache_key("signals_v2_real_v3", category or "all", action or "all", limit)
+    cache_key = _make_cache_key("signals_v2_real_v4", category or "all", action or "all", limit)
     cached = await cache_get(cache_key)
     if cached:
         return cached
@@ -245,14 +599,13 @@ async def get_all_signals(
     for asset in assets:
         market = market_by_symbol[asset.symbol.upper()]
         current_price = float(market.get("price") or 0.0)
-        change = float(market.get("change") or 0.0)
-        # Compute implied deviation when the source reports no change data
-        if change == 0.0 and current_price > 0 and asset.base_price > 0:
-            change = round(((current_price - asset.base_price) / asset.base_price) * 100, 4)
         priced = current_price > 0 and market.get("status") != "unavailable"
         triggering_event = _pick_event_for_asset(asset, live_events)
-        act, confidence, directional_bias = _analyze_action(
-            asset, market, triggering_event
+        breakdown = _build_action_breakdown(asset, market, triggering_event)
+        act, confidence, directional_bias = (
+            breakdown.action,
+            breakdown.confidence,
+            breakdown.raw_score,
         )
         uncertainty = 1.0 - confidence
         realized_vol = _observed_volatility(market)
@@ -288,14 +641,10 @@ async def get_all_signals(
             bullish_strength = 0.0
             bearish_strength = 0.0
 
-        chain = _build_reasoning_chain(asset, act, triggering_event, confidence, market)
-        timeline = _build_event_timeline(triggering_event, asset, act, market, confidence)
+        chain = _build_reasoning_chain(asset, breakdown)
+        timeline = _build_event_timeline(triggering_event, asset, breakdown)
         event_title = triggering_event["title"] if triggering_event else "No verified event linked"
-        summary = (
-            f"{act} {asset.label}: observed movement {change:+.2f}% from "
-            f"{market.get('source', 'unknown')} ({market.get('data_status', 'unavailable')}). "
-            f"{event_title}."
-        )
+        summary = _summarize_reasoning(asset, breakdown)
 
         sig = {
             # ── Identity ──────────────────────────────────────────────
@@ -338,6 +687,9 @@ async def get_all_signals(
             # ── Reasoning ─────────────────────────────────────────────
             "reasoning_summary":  summary,
             "reasoning_chain":    chain,
+            "explainability":     _build_explainability(
+                breakdown, market, volatility_label, trade_setup["atr_pct"],
+            ),
             # ── Event timeline ────────────────────────────────────────
             "event_timeline":     timeline,
             # ── Related ───────────────────────────────────────────────
@@ -345,7 +697,7 @@ async def get_all_signals(
             # ── Metadata ──────────────────────────────────────────────
             "generated_at": datetime.now(UTC).isoformat(),
             "price": current_price if priced else None,
-            "live_change_pct": change if priced else None,
+            "live_change_pct": breakdown.change_pct if priced else None,
             "quote_timestamp": _iso_timestamp(market.get("timestamp")),
             "data_status": market.get("data_status", "unavailable"),
             "data_source": market.get("source", "unknown"),
@@ -433,51 +785,6 @@ def _market_class_for_category(category: str) -> str:
         "commodity": "commodities", "bond": "bonds", "etf": "etfs",
         "equity_index": "indices",
     }.get(category, category)
-
-
-def _analyze_action(
-    asset: AssetDefinition,
-    market: dict,
-    event: dict | None,
-) -> tuple[str, float, float]:
-    """Create an explainable direction score from real movement and real events."""
-    price = float(market.get("price") or 0.0)
-    if price <= 0 or market.get("status") == "unavailable":
-        return "HOLD", 0.0, 0.0
-
-    change = float(market.get("change") or 0.0)
-
-    # When the provider returns no change data (e.g. daily reference rates),
-    # compute implied deviation from the asset's base_price so that the AI
-    # analysis still produces meaningful bullish/bearish signals.
-    if change == 0.0 and asset.base_price > 0 and price > 0:
-        change = ((price - asset.base_price) / asset.base_price) * 100
-
-    threshold = {
-        "stock": 0.50, "crypto": 1.00, "forex": 0.15,
-        "commodity": 0.60, "bond": 0.35, "etf": 0.45,
-        "equity_index": 0.40,
-    }.get(asset.category, 0.50)
-    movement_score = max(-1.0, min(1.0, change / threshold))
-    score = movement_score
-
-    if event:
-        rule = _EVENT_ASSET_RULES.get(event["category"], {}).get(asset.symbol)
-        if rule:
-            event_action, event_confidence = rule
-            event_direction = 1.0 if event_action == "BUY" else -1.0 if event_action == "SELL" else 0.0
-            event_score = event_direction * event_confidence * float(event["severity"])
-            score = movement_score * 0.70 + event_score * 0.30
-
-    action = "BUY" if score >= 0.35 else "SELL" if score <= -0.35 else "HOLD"
-    freshness = {
-        "live": 1.0, "delayed": 0.85, "stale": 0.55,
-        "unavailable": 0.0,
-    }.get(str(market.get("data_status") or "unavailable"), 0.7)
-    confidence = min(0.95, (0.45 + abs(score) * 0.45) * freshness)
-    if action == "HOLD":
-        confidence = min(confidence, 0.55 * freshness)
-    return action, confidence, score
 
 
 def _observed_volatility(market: dict) -> float:

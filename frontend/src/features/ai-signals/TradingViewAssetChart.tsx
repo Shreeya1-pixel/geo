@@ -215,28 +215,34 @@ export function TradingViewAssetChart({
 
     return (
         <section
-            className="bg-white/5 border border-white/10 rounded-xl p-6"
+            className="rounded-xl border border-white/10 bg-[#07091a]/70 p-4 sm:p-5"
             aria-label={`TradingView chart for ${label}`}
         >
             <div className="flex flex-wrap items-start justify-between gap-4">
-                <div>
-                    <h3 className="text-lg font-bold font-mono text-white flex items-center gap-2">
-                        <BarChart3 className="w-5 h-5 text-[#a855f7]" />
-                        TRADINGVIEW CHART
-                    </h3>
-                    <p className="text-white/60 font-mono text-xs mt-1">
-                        {label} · {symbol}
-                    </p>
-                    {resolvedSymbol && (
-                        <p className="text-white/40 font-mono text-[11px] mt-1">
-                            {resolvedSymbol} · {resolution.exchange} · {resolution.country} · {resolution.currency}
+                <div className="flex items-start gap-3">
+                    <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-[#a855f7]/30 bg-[#a855f7]/10">
+                        <BarChart3 className="h-4 w-4 text-[#c084fc]" />
+                    </span>
+                    <div>
+                        <h3 className="font-mono text-[11px] font-bold uppercase tracking-[0.16em] text-white">
+                            Price Action
+                        </h3>
+                        <p className="mt-0.5 font-mono text-sm font-semibold text-white/80">
+                            {label}
+                            <span className="ml-2 text-[11px] font-normal text-white/40">{symbol}</span>
                         </p>
-                    )}
+                        {resolvedSymbol && (
+                            <p className="mt-1 font-mono text-[10px] text-white/30">
+                                {resolvedSymbol} · {resolution.exchange} · {resolution.country} ·{' '}
+                                {resolution.currency}
+                            </p>
+                        )}
+                    </div>
                 </div>
 
                 {resolvedSymbol && (
                     <div
-                        className="flex flex-wrap gap-1.5"
+                        className="flex flex-wrap gap-1 rounded-lg border border-white/8 bg-white/[0.03] p-1"
                         role="group"
                         aria-label="Chart timeframe"
                     >
@@ -249,11 +255,12 @@ export function TradingViewAssetChart({
                                     onClick={() => setInterval(frame.id)}
                                     aria-pressed={active}
                                     title={frame.title}
-                                    className={`px-2.5 py-1 rounded-md border font-mono text-[11px] transition-all ${
+                                    className={`rounded-md px-2 py-1 font-mono text-[10px] font-semibold transition-colors ${
                                         active
-                                            ? 'bg-[#a855f7]/20 border-[#a855f7]/50 text-[#e9d5ff]'
-                                            : 'bg-white/5 border-white/10 text-white/50 hover:bg-white/10 hover:text-white/80'
+                                            ? 'bg-[#a855f7]/20 text-[#e9d5ff]'
+                                            : 'text-white/40 hover:bg-white/5 hover:text-white/75'
                                     }`}
+                                    style={{ minHeight: 'unset' }}
                                 >
                                     {frame.label}
                                 </button>
@@ -295,7 +302,7 @@ export function TradingViewAssetChart({
                         <div
                             id={containerId}
                             ref={hostRef}
-                            className="h-[420px] w-full sm:h-[500px] lg:h-[560px]"
+                            className="h-[300px] w-full sm:h-[340px] xl:h-[360px] 2xl:h-[400px]"
                         />
                         {status !== 'ready' && (
                             <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-[#03060f]/92 px-6 text-center">

@@ -13,16 +13,11 @@ import { api } from '@/shared/api/client'
 import 'maplibre-gl/dist/maplibre-gl.css'
 
 // ── Dark map style ─────────────────────────────────────────────────────────
-const MAP_STYLE = {
-    version: 8,
-    sources: {
-        tiles: { type: 'raster', tiles: ['https://basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}.png'], tileSize: 256 }
-    },
-    layers: [
-        { id: 'bg', type: 'background', paint: { 'background-color': '#03070f' } },
-        { id: 'tiles', type: 'raster', source: 'tiles', paint: { 'raster-opacity': 0.45 } }
-    ]
-}
+// OpenFreeMap serves the OpenMapTiles schema without an API key. CARTO's
+// formerly keyless CDN now stamps its tiles with an "API key required"
+// watermark, so the map uses this style instead.
+const MAP_STYLE = 'https://tiles.openfreemap.org/styles/dark'
+const MAP_ATTRIBUTION = '© OpenFreeMap © OpenMapTiles © OpenStreetMap contributors'
 const INITIAL_VIEW = { longitude: 18, latitude: 28, zoom: 1.5, pitch: 0, bearing: 0 }
 
 function gtiToFill(score: number, selected = false): [number, number, number, number] {
@@ -390,7 +385,10 @@ export function DeckGLMap() {
                     layers={layers}
                     getCursor={() => 'crosshair'}
                 >
-                    <Map mapStyle={MAP_STYLE as any} />
+                    <Map
+                        mapStyle={MAP_STYLE}
+                        attributionControl={{ compact: true, customAttribution: MAP_ATTRIBUTION }}
+                    />
                 </DeckGL>
 
                 {/* Map HUD */}

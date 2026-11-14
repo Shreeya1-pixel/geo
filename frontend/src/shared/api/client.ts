@@ -2,12 +2,12 @@ import { GTIResponseSchema, SignalsResponseSchema, EventsResponseSchema, type GT
 import { fallbackGTI, fallbackEvents, fallbackGlobeCountries, fallbackMarketImpact } from './mockData'
 import { getStoredEmail } from '@/shared/auth/useAuth'
 
-// VITE_API_URL must be set in the Vercel dashboard as a *build* environment
-// variable — Vite inlines it at build time and vercel.json cannot supply it.
-// The fallback matches the Render service name in render.yaml (`geotrade-api`).
-const PROD_API = 'https://geotrade-api.onrender.com/api/v1'
+// Production defaults to a same-origin path so the Vercel deployment can route
+// /api/* to the FastAPI service (see vercel.json). VITE_API_URL overrides it
+// wherever the API lives on another host; Vite inlines the value at build time,
+// which is why render.yaml sets it for the Render static site.
 const defaultBase = typeof window !== 'undefined' && !/localhost|127\.0\.0\.1/.test(window.location.hostname)
-  ? PROD_API
+  ? '/api/v1'
   : 'http://localhost:8000/api/v1'
 export const API_BASE = (import.meta.env.VITE_API_URL as string)?.trim() || defaultBase
 

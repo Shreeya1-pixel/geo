@@ -162,12 +162,10 @@ services:
 
   # ── Frontend (static bundle) ────────────────────────────────────────────────
   # Render can host the Vite output too, which keeps the whole deploy on one
-  # account and one pipeline. VITE_API_URL is deliberately NOT set here:
-  # frontend/src/shared/api/client.ts resolves to
-  # https://geotrade-api.onrender.com/api/v1 whenever the page is not served
-  # from localhost, which is this service's own .onrender.com host. If you
-  # rename geotrade-api or give it a custom domain, set VITE_API_URL to the
-  # new base including the /api/v1 prefix.
+  # account and one pipeline. client.ts defaults to a same-origin /api/v1 for
+  # the Vercel deployment, so this static site has to point at the Render API
+  # explicitly. Keep the /api/v1 prefix and update this if you rename
+  # geotrade-api or attach a custom domain.
   - type: web
     name: geotrade-web
     runtime: static
@@ -180,6 +178,8 @@ services:
     envVars:
       - key: NODE_VERSION
         value: 22                 # Vite 7 needs Node >= 20.19
+      - key: VITE_API_URL
+        value: https://geotrade-api.onrender.com/api/v1
 
 databases:
   - name: geotrade-db

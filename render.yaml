@@ -96,7 +96,7 @@ services:
       - key: NODE_VERSION
         value: "22"
       - key: VITE_API_URL
-        value: https://geotrade-api.onrender.com/api/v1
+        value: https://geotrade-api-7rz6.onrender.com/api/v1
 
   # ── Redis-compatible Key Value ──────────────────────────────────────────────
   - type: keyvalue
